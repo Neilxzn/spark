@@ -75,7 +75,10 @@ object SQLExecution {
           executionId, callSite.shortForm, callSite.longForm, queryExecution.toString,
           SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan), System.currentTimeMillis()))
         try {
-          body
+          val jobTag = sparkSession.conf.getOption("spark.custom.jobTag")
+          withCustomJobTag(sparkSession, jobTag.getOrElse("")) {
+            body
+          }
         } finally {
           sc.listenerBus.post(SparkListenerSQLExecutionEnd(
             executionId, System.currentTimeMillis()))
@@ -97,12 +100,27 @@ object SQLExecution {
     val oldExecutionId = sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     withSQLConfPropagated(sparkSession) {
       try {
+        val jobTag = sparkSession.conf.getOption("spark.custom.jobTag")
         sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, executionId)
-        body
+        withCustomJobTag(sparkSession, jobTag.getOrElse("")) {
+          body
+        }
       } finally {
         sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, oldExecutionId)
       }
     }
+  }
+
+  def withCustomJobTag[T](sparkSession: SparkSession, jobTag: String)(body: => T): T = {
+    val sc = sparkSession.sparkContext
+    val oldJobTag = sc.getLocalProperty("spark.custom.jobTag")
+      try {
+        sc.setLocalProperty("spark.custom.jobTag", jobTag)
+        body
+      } finally {
+        sc.setLocalProperty("spark.custom.jobTag", oldJobTag)
+      }
+
   }
 
   /**
