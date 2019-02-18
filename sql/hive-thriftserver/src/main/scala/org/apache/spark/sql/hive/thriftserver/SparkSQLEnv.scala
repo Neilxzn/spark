@@ -19,6 +19,8 @@ package org.apache.spark.sql.hive.thriftserver
 
 import java.io.PrintStream
 
+import org.apache.hadoop.hive.conf.HiveConf
+
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{SparkSession, SQLContext}
@@ -34,7 +36,7 @@ private[hive] object SparkSQLEnv extends Logging {
 
   def init() {
     if (sqlContext == null) {
-      val sparkConf = new SparkConf(loadDefaults = true)
+      val sparkConf = new SparkConf(loadDefaults = true).setMaster("local[4]")
       // If user doesn't specify the appName, we want to get [SparkSQL::localHostName] instead of
       // the default appName [SparkSQLCLIDriver] in cli or beeline.
       val maybeAppName = sparkConf
@@ -55,6 +57,11 @@ private[hive] object SparkSQLEnv extends Logging {
       metadataHive.setInfo(new PrintStream(System.err, true, "UTF-8"))
       metadataHive.setError(new PrintStream(System.err, true, "UTF-8"))
       sparkSession.conf.set(HiveUtils.FAKE_HIVE_VERSION.key, HiveUtils.builtinHiveVersion)
+
+      HiveConf.metaVars.foreach { key =>
+        sparkContext.hadoopConfiguration
+          .set(key.varname, metadataHive.getConf(key.varname, key.defaultStrVal))
+      }
     }
   }
 
