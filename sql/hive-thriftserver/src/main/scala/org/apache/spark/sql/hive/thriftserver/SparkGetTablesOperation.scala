@@ -92,29 +92,19 @@ private[hive] class SparkGetTablesOperation(
     Thread.currentThread().setContextClassLoader(executionHiveClassLoader)
 
     try {
-      logWarning("get metastoreClient ")
-      val metastoreClient: IMetaStoreClient = getParentSession.getMetaStoreClient
+
       val schemaPattern: String = convertSchemaPattern(schemaName)
-      logWarning("get schemaPattern " + schemaPattern)
       val matchingDbs = catalog.listDatabases(schemaPattern)
-      logWarning("get matchingDbs " + matchingDbs)
       if (isAuthV2Enabled) {
         val privObjs =
           HivePrivilegeObjectUtils.getHivePrivDbObjects(seqAsJavaListConverter(matchingDbs).asJava)
         val cmdStr = s"catalog : $catalogName, schemaPattern : $schemaName"
         authorizeMetaGets(HiveOperationType.GET_TABLES, privObjs, cmdStr)
       }
-      logWarning("get tablePattern ")
       val tablePattern = convertIdentifierPattern(tableName, true)
-
-
       for (dbName <- matchingDbs) {
-        logWarning("get dbName " + dbName)
         val tableNames = catalog.listTables(dbName, tablePattern)
-        logWarning("listTables count" + tableNames.length)
         val tablenamestrs = tableNames.map{ o => o.table}
-        logWarning("table namestrs" + tablenamestrs)
-//        invoke(classOf[Hive], catalog, "ensureCurrentState", classOf[STATE] -> STATE.NOTINITED)
 
         catalog.getTablesMetadata(dbName,
           catalog.listTables(dbName, tablePattern).map(o => o.table).toList)
@@ -130,24 +120,7 @@ private[hive] class SparkGetTablesOperation(
               rowSet.addRow(rowData)
             }
         }
-//        val  tableList = metastoreClient.getTableObjectsByName(dbName,
-//          seqAsJavaListConverter(tablenamestrs).asJava)
-//          tableList.asScala.toList.foreach { table =>
-//            val tableType = table.getTableType match {
-//            case "EXTERNAL" => "TABLE"
-//            case  "MANAGED" => "TABLE"
-//            case  "VIEW" => "VIEW"
-//          }
-//          val rowData: Array[AnyRef] = Array[AnyRef]("",
-//            table.getDbName, table.getTableName,
-//            tableType,
-//            table.getParameters.get("comment"))
-//          if (tableTypes.isEmpty || tableTypes.contains(tableType)) {
-//            rowSet.addRow(rowData)
-//          }
-//        }
       }
-      logWarning("get tables " + rowSet.numRows())
       setState(OperationState.FINISHED)
     } catch {
       case e: Exception =>

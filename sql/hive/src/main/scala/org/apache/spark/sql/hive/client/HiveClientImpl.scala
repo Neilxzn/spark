@@ -692,12 +692,13 @@ private[hive] class HiveClientImpl(
   override def getTables(dbName: String, tableNames: Seq[String]):
   Seq[CatalogTable] = withHiveState {
    // client.getTableObjectsByName(dbName, tableNames.asJava).asScala
-    val dbName2 = dbName.toLowerCase
+    val dbNameLowerCase = dbName.toLowerCase
     val metaStoreClient: IMetaStoreClient = client.getMSC
-    if (SessionState.get.getTempTables.size == 0) {
-      logWarning("SessionState.get().getTempTables().size()=0")
-      // No temp tables, just call underlying client
-      val tables = metaStoreClient.getTableObjectsByName(dbName2, tableNames.asJava).asScala
+   val tempViewSize = SessionState.get.getTempTables.size
+    logInfo(s"SessionState.get().getTempTables().size()=$tempViewSize")
+    if (tempViewSize == 0) {
+      // Spark sql not   No temp tables, just call underlying client
+      val tables = metaStoreClient.getTableObjectsByName(dbNameLowerCase, tableNames.asJava).asScala
       return  tables.map { metaTable =>
 
        val  h = new HiveTable(metaTable)
@@ -761,7 +762,6 @@ private[hive] class HiveClientImpl(
           case (key, _) => excludedTableProperties.contains(key)
         }
         val comment = properties.get("comment")
-
         CatalogTable(
           identifier = TableIdentifier(h.getTableName, Option(h.getDbName)),
           tableType = h.getTableType match {
@@ -810,7 +810,10 @@ private[hive] class HiveClientImpl(
           ignoredProperties = ignoredProperties.toMap)
       }
     }
-    new ArrayBuffer[CatalogTable]()
+    return tableNames.map{ tablename =>
+      getTable(dbNameLowerCase, tablename)
+
+    }
 
   }
 
