@@ -831,7 +831,8 @@ abstract class HiveThriftServer2Test extends SparkFunSuite with BeforeAndAfterAl
 
   protected val startScript = "../../sbin/start-thriftserver.sh".split("/").mkString(File.separator)
   protected val stopScript = "../../sbin/stop-thriftserver.sh".split("/").mkString(File.separator)
-
+  val ss = System.getProperty("user.dir")
+   logError(System.getProperty("user.dir"))
   private var listeningPort: Int = _
   protected def serverPort: Int = listeningPort
 

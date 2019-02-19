@@ -19,7 +19,8 @@ package org.apache.spark.sql.hive.client
 
 import java.io.{File, PrintStream}
 import java.lang.{Iterable => JIterable}
-import java.util.{Locale, Map => JMap}
+import java.util
+import java.util.{List, Locale, Map => JMap}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -29,9 +30,8 @@ import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hive.common.StatsSetupConst
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
-import org.apache.hadoop.hive.metastore.{TableType => HiveTableType}
-import org.apache.hadoop.hive.metastore.api.{Database => HiveDatabase, FieldSchema, Order}
-import org.apache.hadoop.hive.metastore.api.{SerDeInfo, StorageDescriptor}
+import org.apache.hadoop.hive.metastore.{IMetaStoreClient, TableType => HiveTableType}
+import org.apache.hadoop.hive.metastore.api.{Database => HiveDatabase, FieldSchema, Order, SerDeInfo, StorageDescriptor}
 import org.apache.hadoop.hive.ql.Driver
 import org.apache.hadoop.hive.ql.metadata.{Hive, Partition => HivePartition, Table => HiveTable}
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_ASC
@@ -479,6 +479,7 @@ private[hive] class HiveClientImpl(
   override def createTable(table: CatalogTable, ignoreIfExists: Boolean): Unit = withHiveState {
     verifyColumnDataType(table.dataSchema)
     client.createTable(toHiveTable(table, Some(userName)), ignoreIfExists)
+
   }
 
   override def dropTable(
@@ -686,6 +687,131 @@ private[hive] class HiveClientImpl(
 
   override def listTables(dbName: String, pattern: String): Seq[String] = withHiveState {
     client.getTablesByPattern(dbName, pattern).asScala
+  }
+
+  override def getTables(dbName: String, tableNames: Seq[String]):
+  Seq[CatalogTable] = withHiveState {
+   // client.getTableObjectsByName(dbName, tableNames.asJava).asScala
+    val dbName2 = dbName.toLowerCase
+    val metaStoreClient: IMetaStoreClient = client.getMSC
+    if (SessionState.get.getTempTables.size == 0) {
+      logWarning("SessionState.get().getTempTables().size()=0")
+      // No temp tables, just call underlying client
+      val tables = metaStoreClient.getTableObjectsByName(dbName2, tableNames.asJava).asScala
+      return  tables.map { metaTable =>
+
+       val  h = new HiveTable(metaTable)
+        // Note: Hive separates partition columns and the schema, but for us the
+        // partition columns are part of the schema
+        val cols = h.getCols.asScala.map(fromHiveColumn)
+        val partCols = h.getPartCols.asScala.map(fromHiveColumn)
+        val schema = StructType(cols ++ partCols)
+
+        val bucketSpec = if (h.getNumBuckets > 0) {
+          val sortColumnOrders = h.getSortCols.asScala
+          // Currently Spark only supports columns to be sorted in ascending order
+          // but Hive can support both ascending and descending order. If all the columns
+          // are sorted in ascending order, only then propagate the sortedness information
+          // to downstream processing / optimizations in Spark
+          // TODO: In future we can have Spark support columns sorted in descending order
+          val allAscendingSorted = sortColumnOrders.forall(_.getOrder == HIVE_COLUMN_ORDER_ASC)
+
+          val sortColumnNames = if (allAscendingSorted) {
+            sortColumnOrders.map(_.getCol)
+          } else {
+            Seq.empty
+          }
+          Option(BucketSpec(h.getNumBuckets, h.getBucketCols.asScala, sortColumnNames))
+        } else {
+          None
+        }
+
+        // Skew spec and storage handler can't be mapped to CatalogTable (yet)
+        val unsupportedFeatures = ArrayBuffer.empty[String]
+
+        if (!h.getSkewedColNames.isEmpty) {
+          unsupportedFeatures += "skewed columns"
+        }
+
+        if (h.getStorageHandler != null) {
+          unsupportedFeatures += "storage handler"
+        }
+
+        if (h.getTableType == HiveTableType.VIRTUAL_VIEW && partCols.nonEmpty) {
+          unsupportedFeatures += "partitioned view"
+        }
+
+        val properties = Option(h.getParameters).map(_.asScala.toMap).orNull
+
+        // Hive-generated Statistics are also recorded in ignoredProperties
+        val ignoredProperties = scala.collection.mutable.Map.empty[String, String]
+        for (key <- HiveStatisticsProperties; value <- properties.get(key)) {
+          ignoredProperties += key -> value
+        }
+
+        val excludedTableProperties = HiveStatisticsProperties ++ Set(
+          // The property value of "comment" is moved to the dedicated field "comment"
+          "comment",
+          // For EXTERNAL_TABLE, the table properties has a particular field "EXTERNAL".
+          // This is added in the function toHiveTable.
+          "EXTERNAL"
+        )
+
+        val filteredProperties = properties.filterNot {
+          case (key, _) => excludedTableProperties.contains(key)
+        }
+        val comment = properties.get("comment")
+
+        CatalogTable(
+          identifier = TableIdentifier(h.getTableName, Option(h.getDbName)),
+          tableType = h.getTableType match {
+            case HiveTableType.EXTERNAL_TABLE => CatalogTableType.EXTERNAL
+            case HiveTableType.MANAGED_TABLE => CatalogTableType.MANAGED
+            case HiveTableType.VIRTUAL_VIEW => CatalogTableType.VIEW
+            case HiveTableType.INDEX_TABLE =>
+              throw new AnalysisException("Hive index table is not supported.")
+          },
+          storage = CatalogStorageFormat(
+            locationUri = shim.getDataLocation(h).map(CatalogUtils.stringToURI),
+            // To avoid ClassNotFound exception, we try our best to not get the format class, but
+            // the class name directly. However, for non-native tables, there is no interface to get
+            // the format class name, so we may still throw ClassNotFound in this case.
+            inputFormat = Option(h.getTTable.getSd.getInputFormat).orElse {
+              Option(h.getStorageHandler).map(_.getInputFormatClass.getName)
+            },
+            outputFormat = Option(h.getTTable.getSd.getOutputFormat).orElse {
+              Option(h.getStorageHandler).map(_.getOutputFormatClass.getName)
+            },
+            serde = Option(h.getSerializationLib),
+            compressed = h.getTTable.getSd.isCompressed,
+            properties = Option(h.getTTable.getSd.getSerdeInfo.getParameters)
+              .map(_.asScala.toMap).orNull
+          ),
+          schema = schema,
+          // If the table is written by Spark, we will put bucketing information in table,
+          // and will always overwrite the bucket spec in hive metastore by the bucketing
+          // in table properties. This means, if we have bucket spec in both hive metastore and
+          // table properties, we will trust the one in table properties.
+          partitionColumnNames = partCols.map(_.name),
+          bucketSpec = bucketSpec,
+          owner = Option(h.getOwner).getOrElse(""),
+          createTime = h.getTTable.getCreateTime.toLong * 1000,
+          lastAccessTime = h.getLastAccessTime.toLong * 1000,
+          // For EXTERNAL_TABLE, the table properties has a particular field "EXTERNAL".
+          // This is added in the function toHiveTable.
+          properties = filteredProperties,
+          stats = readHiveStats(properties),
+          viewText = Option(h.getViewExpandedText),
+          // In older versions of Spark(before 2.2.0), we expand the view original text and store
+          // that into `viewExpandedText`, and that should be used in view resolution. So we get
+          // `viewExpandedText` instead of `viewOriginalText` for viewText here.
+          comment = comment,
+          unsupportedFeatures = unsupportedFeatures,
+          ignoredProperties = ignoredProperties.toMap)
+      }
+    }
+    new ArrayBuffer[CatalogTable]()
+
   }
 
   /**

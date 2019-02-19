@@ -98,7 +98,7 @@ private[thriftserver] class SparkSQLOperationManager()
     require(sqlContext != null, s"Session handle: ${parentSession.getSessionHandle} has not been" +
       s" initialized or had already closed.")
     val operation = new SparkGetTablesOperation(sqlContext, parentSession,
-      catalogName, schemaName, tableName, tableTypes)
+      catalogName, "xiezhineng", tableName, tableTypes)
     handleToOperation.put(operation.getHandle, operation)
     logDebug(s"Created GetTablesOperation with session=$parentSession.")
     operation

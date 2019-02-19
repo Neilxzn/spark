@@ -700,6 +700,9 @@ private[spark] class HiveExternalCatalog(conf: SparkConf, hadoopConf: Configurat
     restoreTableMetadata(getRawTable(db, table))
   }
 
+  def getTables(db: String, tables: List[String]): Seq[CatalogTable] = withClient {
+    client.getTables(db, tables).map(table => restoreTableMetadata(table))
+  }
   /**
    * Restores table metadata from the table properties. This method is kind of a opposite version
    * of [[createTable]].

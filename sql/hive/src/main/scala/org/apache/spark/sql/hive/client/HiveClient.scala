@@ -61,6 +61,7 @@ private[hive] trait HiveClient {
   /** Returns the names of tables in the given database that matches the given pattern. */
   def listTables(dbName: String, pattern: String): Seq[String]
 
+
   /** Sets the name of current database. */
   def setCurrentDatabase(databaseName: String): Unit
 
@@ -80,6 +81,8 @@ private[hive] trait HiveClient {
   final def getTable(dbName: String, tableName: String): CatalogTable = {
     getTableOption(dbName, tableName).getOrElse(throw new NoSuchTableException(dbName, tableName))
   }
+  /** Returns the specified table, or throws [[NoSuchTableException]]. */
+  def getTables(dbName: String, tableNames: Seq[String]): Seq[CatalogTable]
 
   /** Returns the metadata for the specified table or None if it doesn't exist. */
   def getTableOption(dbName: String, tableName: String): Option[CatalogTable]

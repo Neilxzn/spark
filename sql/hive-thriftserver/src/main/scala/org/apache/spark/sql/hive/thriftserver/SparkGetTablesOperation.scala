@@ -17,12 +17,16 @@
 
 package org.apache.spark.sql.hive.thriftserver
 
-import java.util.{List => JList, UUID}
 
-import scala.collection.JavaConverters.seqAsJavaListConverter
+import java.util
+import java.util.{List => JList, UUID }
 
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HiveOperationType
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObjectUtils
+import scala.collection.JavaConverters._
+
+import org.apache.hadoop.hive.metastore.IMetaStoreClient
+import org.apache.hadoop.hive.ql.security.authorization.plugin.{HiveOperationType, HivePrivilegeObjectUtils}
+import org.apache.hive.service.AbstractService
+import org.apache.hive.service.Service.STATE
 import org.apache.hive.service.cli._
 import org.apache.hive.service.cli.operation.GetTablesOperation
 import org.apache.hive.service.cli.session.HiveSession
@@ -31,6 +35,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.catalyst.catalog.CatalogTableType._
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog
+import org.apache.spark.sql.hive.thriftserver.ReflectionUtils.invoke
+
+
 
 /**
  * Spark's own GetTablesOperation
@@ -84,33 +91,69 @@ private[hive] class SparkGetTablesOperation(
     val executionHiveClassLoader = sqlContext.sharedState.jarClassLoader
     Thread.currentThread().setContextClassLoader(executionHiveClassLoader)
 
-    val schemaPattern = convertSchemaPattern(schemaName)
-    val matchingDbs = catalog.listDatabases(schemaPattern)
-
-    if (isAuthV2Enabled) {
-      val privObjs =
-        HivePrivilegeObjectUtils.getHivePrivDbObjects(seqAsJavaListConverter(matchingDbs).asJava)
-      val cmdStr = s"catalog : $catalogName, schemaPattern : $schemaName"
-      authorizeMetaGets(HiveOperationType.GET_TABLES, privObjs, cmdStr)
-    }
-    val tablePattern = convertIdentifierPattern(tableName, true)
-    matchingDbs.foreach { dbName =>
-      catalog.listTables(dbName, tablePattern).foreach { tableIdentifier =>
-        val catalogTable = catalog.getTableMetadata(tableIdentifier)
-        val tableType = sparkToClientMapping(catalogTable.tableType)
-        if (tableTypes == null || tableTypes.isEmpty || tableTypes.contains(tableType)) {
-          val rowData = Array[AnyRef](
-            "",
-            catalogTable.database,
-            catalogTable.identifier.table,
-            tableType,
-            catalogTable.comment.getOrElse(""))
-          rowSet.addRow(rowData)
-        }
+    try {
+      logWarning("get metastoreClient ")
+      val metastoreClient: IMetaStoreClient = getParentSession.getMetaStoreClient
+      val schemaPattern: String = convertSchemaPattern(schemaName)
+      logWarning("get schemaPattern " + schemaPattern)
+      val matchingDbs = catalog.listDatabases(schemaPattern)
+      logWarning("get matchingDbs " + matchingDbs)
+      if (isAuthV2Enabled) {
+        val privObjs =
+          HivePrivilegeObjectUtils.getHivePrivDbObjects(seqAsJavaListConverter(matchingDbs).asJava)
+        val cmdStr = s"catalog : $catalogName, schemaPattern : $schemaName"
+        authorizeMetaGets(HiveOperationType.GET_TABLES, privObjs, cmdStr)
       }
-    }
+      logWarning("get tablePattern ")
+      val tablePattern = convertIdentifierPattern(tableName, true)
 
-    setState(OperationState.FINISHED)
+
+      for (dbName <- matchingDbs) {
+        logWarning("get dbName " + dbName)
+        val tableNames = catalog.listTables(dbName, tablePattern)
+        logWarning("listTables count" + tableNames.length)
+        val tablenamestrs = tableNames.map{ o => o.table}
+        logWarning("table namestrs" + tablenamestrs)
+//        invoke(classOf[Hive], catalog, "ensureCurrentState", classOf[STATE] -> STATE.NOTINITED)
+
+        catalog.getTablesMetadata(dbName,
+          catalog.listTables(dbName, tablePattern).map(o => o.table).toList)
+          .foreach{ catalogTable =>
+            val tableType = sparkToClientMapping(catalogTable.tableType)
+            if (tableTypes == null || tableTypes.isEmpty || tableTypes.contains(tableType)) {
+              val rowData = Array[AnyRef](
+                "",
+                catalogTable.database,
+                catalogTable.identifier.table,
+                tableType,
+                catalogTable.comment.getOrElse(""))
+              rowSet.addRow(rowData)
+            }
+        }
+//        val  tableList = metastoreClient.getTableObjectsByName(dbName,
+//          seqAsJavaListConverter(tablenamestrs).asJava)
+//          tableList.asScala.toList.foreach { table =>
+//            val tableType = table.getTableType match {
+//            case "EXTERNAL" => "TABLE"
+//            case  "MANAGED" => "TABLE"
+//            case  "VIEW" => "VIEW"
+//          }
+//          val rowData: Array[AnyRef] = Array[AnyRef]("",
+//            table.getDbName, table.getTableName,
+//            tableType,
+//            table.getParameters.get("comment"))
+//          if (tableTypes.isEmpty || tableTypes.contains(tableType)) {
+//            rowSet.addRow(rowData)
+//          }
+//        }
+      }
+      logWarning("get tables " + rowSet.numRows())
+      setState(OperationState.FINISHED)
+    } catch {
+      case e: Exception =>
+        setState(OperationState.ERROR)
+        throw new HiveSQLException(e)
+    }
   }
 
   override def getNextRowSet(order: FetchOrientation, maxRows: Long): RowSet = {
