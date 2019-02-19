@@ -53,12 +53,12 @@ object SQLExecution {
   }
 
   /**
-   * Wrap an action that will execute "queryExecution" to track all Spark jobs in the body so that
-   * we can connect them with an execution.
-   */
+    * Wrap an action that will execute "queryExecution" to track all Spark jobs in the body so that
+    * we can connect them with an execution.
+    */
   def withNewExecutionId[T](
-      sparkSession: SparkSession,
-      queryExecution: QueryExecution)(body: => T): T = {
+                             sparkSession: SparkSession,
+                             queryExecution: QueryExecution)(body: => T): T = {
     val sc = sparkSession.sparkContext
     val oldExecutionId = sc.getLocalProperty(EXECUTION_ID_KEY)
     val executionId = SQLExecution.nextExecutionId
@@ -75,7 +75,10 @@ object SQLExecution {
           executionId, callSite.shortForm, callSite.longForm, queryExecution.toString,
           SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan), System.currentTimeMillis()))
         try {
-          body
+          val jobTag = sparkSession.conf.getOption("spark.custom.jobTag")
+          withCustomJobTag(sparkSession, jobTag.getOrElse("")) {
+            body
+          }
         } finally {
           sc.listenerBus.post(SparkListenerSQLExecutionEnd(
             executionId, System.currentTimeMillis()))
@@ -88,27 +91,42 @@ object SQLExecution {
   }
 
   /**
-   * Wrap an action with a known executionId. When running a different action in a different
-   * thread from the original one, this method can be used to connect the Spark jobs in this action
-   * with the known executionId, e.g., `BroadcastExchangeExec.relationFuture`.
-   */
+    * Wrap an action with a known executionId. When running a different action in a different
+    * thread from the original one, this method can be used to connect the Spark jobs in this action
+    * with the known executionId, e.g., `BroadcastExchangeExec.relationFuture`.
+    */
   def withExecutionId[T](sparkSession: SparkSession, executionId: String)(body: => T): T = {
     val sc = sparkSession.sparkContext
     val oldExecutionId = sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     withSQLConfPropagated(sparkSession) {
       try {
+        val jobTag = sparkSession.conf.getOption("spark.custom.jobTag")
         sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, executionId)
-        body
+        withCustomJobTag(sparkSession, jobTag.getOrElse("")) {
+          body
+        }
       } finally {
         sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, oldExecutionId)
       }
     }
   }
 
+  def withCustomJobTag[T](sparkSession: SparkSession, jobTag: String)(body: => T): T = {
+    val sc = sparkSession.sparkContext
+    val oldJobTag = sc.getLocalProperty("spark.custom.jobTag")
+    try {
+      sc.setLocalProperty("spark.custom.jobTag", jobTag)
+      body
+    } finally {
+      sc.setLocalProperty("spark.custom.jobTag", oldJobTag)
+    }
+
+  }
+
   /**
-   * Wrap an action with specified SQL configs. These configs will be propagated to the executor
-   * side via job local properties.
-   */
+    * Wrap an action with specified SQL configs. These configs will be propagated to the executor
+    * side via job local properties.
+    */
   def withSQLConfPropagated[T](sparkSession: SparkSession)(body: => T): T = {
     val sc = sparkSession.sparkContext
     // Set all the specified SQL configs to local properties, so that they can be available at
