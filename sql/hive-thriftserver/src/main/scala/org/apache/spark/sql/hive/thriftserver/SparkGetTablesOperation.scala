@@ -56,7 +56,7 @@ private[hive] class SparkGetTablesOperation(
 
   override def runInternal(): Unit = {
     setState(OperationState.RUNNING)
-    // Always use the latest class loader provided by executionHive's state.
+    // Always use the latest class loader provided by executionHive's  state.
     val executionHiveClassLoader = sqlContext.sharedState.jarClassLoader
     Thread.currentThread().setContextClassLoader(executionHiveClassLoader)
 
