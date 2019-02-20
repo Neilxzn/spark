@@ -429,6 +429,15 @@ class SessionCatalog(
     externalCatalog.getTable(db, table)
   }
 
+  @throws[NoSuchDatabaseException]
+  @throws[NoSuchTableException]
+  def getTablesMetadata(db: String, tablesName: List[String]): Seq[CatalogTable] = {
+    val dbName = formatDatabaseName(db)
+    requireDbExists(dbName)
+    externalCatalog.getTables(db, tablesName)
+  }
+
+
   /**
    * Load files stored in given path into an existing metastore table.
    * If no database is specified, assume the table is in the current database.

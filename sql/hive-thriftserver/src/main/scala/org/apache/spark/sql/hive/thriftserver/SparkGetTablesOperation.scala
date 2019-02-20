@@ -73,19 +73,20 @@ private[hive] class SparkGetTablesOperation(
 
     val tablePattern = convertIdentifierPattern(tableName, true)
     matchingDbs.foreach { dbName =>
-      catalog.listTables(dbName, tablePattern).foreach { tableIdentifier =>
-        val catalogTable = catalog.getTableMetadata(tableIdentifier)
-        val tableType = tableTypeString(catalogTable.tableType)
-        if (tableTypes == null || tableTypes.isEmpty || tableTypes.contains(tableType)) {
-          val rowData = Array[AnyRef](
-            "",
-            catalogTable.database,
-            catalogTable.identifier.table,
-            tableType,
-            catalogTable.comment.getOrElse(""))
-          rowSet.addRow(rowData)
+      catalog.getTablesMetadata(dbName,
+        catalog.listTables(dbName, tablePattern).map(o => o.table).toList)
+        .foreach{ catalogTable =>
+          val tableType = tableTypeString(catalogTable.tableType)
+          if (tableTypes == null || tableTypes.isEmpty || tableTypes.contains(tableType)) {
+            val rowData = Array[AnyRef](
+              "",
+              catalogTable.database,
+              catalogTable.identifier.table,
+              tableType,
+              catalogTable.comment.getOrElse(""))
+            rowSet.addRow(rowData)
+          }
         }
-      }
     }
     setState(OperationState.FINISHED)
   }
