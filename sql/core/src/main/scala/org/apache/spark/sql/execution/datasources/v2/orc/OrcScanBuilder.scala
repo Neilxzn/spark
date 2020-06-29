@@ -22,25 +22,33 @@ import scala.collection.JavaConverters._
 import org.apache.orc.mapreduce.OrcInputFormat
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.quoteIfNeeded
+import org.apache.spark.sql.connector.read.{Scan, SupportsPushDownFilters}
 import org.apache.spark.sql.execution.datasources.PartitioningAwareFileIndex
 import org.apache.spark.sql.execution.datasources.orc.OrcFilters
 import org.apache.spark.sql.execution.datasources.v2.FileScanBuilder
 import org.apache.spark.sql.sources.Filter
-import org.apache.spark.sql.sources.v2.DataSourceOptions
-import org.apache.spark.sql.sources.v2.reader.Scan
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 case class OrcScanBuilder(
     sparkSession: SparkSession,
     fileIndex: PartitioningAwareFileIndex,
     schema: StructType,
     dataSchema: StructType,
-    options: DataSourceOptions) extends FileScanBuilder(schema) {
-  lazy val hadoopConf =
-    sparkSession.sessionState.newHadoopConfWithOptions(options.asMap().asScala.toMap)
+    options: CaseInsensitiveStringMap)
+  extends FileScanBuilder(sparkSession, fileIndex, dataSchema) with SupportsPushDownFilters {
+  lazy val hadoopConf = {
+    val caseSensitiveMap = options.asCaseSensitiveMap.asScala.toMap
+    // Hadoop Configurations are case sensitive.
+    sparkSession.sessionState.newHadoopConfWithOptions(caseSensitiveMap)
+  }
+
+  override protected val supportsNestedSchemaPruning: Boolean = true
 
   override def build(): Scan = {
-    OrcScan(sparkSession, hadoopConf, fileIndex, dataSchema, readSchema)
+    OrcScan(sparkSession, hadoopConf, fileIndex, dataSchema,
+      readDataSchema(), readPartitionSchema(), options, pushedFilters())
   }
 
   private var _pushedFilters: Array[Filter] = Array.empty
@@ -52,8 +60,10 @@ case class OrcScanBuilder(
         // changed `hadoopConf` in executors.
         OrcInputFormat.setSearchArgument(hadoopConf, f, schema.fieldNames)
       }
-      val dataTypeMap = schema.map(f => f.name -> f.dataType).toMap
-      _pushedFilters = OrcFilters.convertibleFilters(schema, dataTypeMap, filters).toArray
+      val dataTypeMap = schema.map(f => quoteIfNeeded(f.name) -> f.dataType).toMap
+      // TODO (SPARK-25557): ORC doesn't support nested predicate pushdown, so they are removed.
+      val newFilters = filters.filter(!_.containsNestedColumn)
+      _pushedFilters = OrcFilters.convertibleFilters(schema, dataTypeMap, newFilters).toArray
     }
     filters
   }

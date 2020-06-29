@@ -48,8 +48,10 @@ import org.apache.hadoop.yarn.security.AMRMTokenIdentifier
 import org.apache.hadoop.yarn.util.Records
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkException}
+import org.apache.spark.api.python.PythonUtils
 import org.apache.spark.deploy.{SparkApplication, SparkHadoopUtil}
 import org.apache.spark.deploy.security.HadoopDelegationTokenManager
+import org.apache.spark.deploy.yarn.ResourceRequestHelper._
 import org.apache.spark.deploy.yarn.config._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
@@ -95,6 +97,8 @@ private[spark] class Client(
 
   // Executor related configurations
   private val executorMemory = sparkConf.get(EXECUTOR_MEMORY)
+  // Executor offHeap memory in MiB.
+  protected val executorOffHeapMemory = YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(sparkConf)
   private val executorMemoryOverhead = sparkConf.get(EXECUTOR_MEMORY_OVERHEAD).getOrElse(
     math.max((MEMORY_OVERHEAD_FACTOR * executorMemory).toLong, MEMORY_OVERHEAD_MIN)).toInt
 
@@ -177,7 +181,8 @@ private[spark] class Client(
 
       // The app staging dir based on the STAGING_DIR configuration if configured
       // otherwise based on the users home directory.
-      val appStagingBaseDir = sparkConf.get(STAGING_DIR).map { new Path(_) }
+      val appStagingBaseDir = sparkConf.get(STAGING_DIR)
+        .map { new Path(_, UserGroupInformation.getCurrentUser.getShortUserName) }
         .getOrElse(FileSystem.get(hadoopConf).getHomeDirectory())
       stagingDirPath = new Path(appStagingBaseDir, getAppStagingDir(appId))
 
@@ -237,18 +242,21 @@ private[spark] class Client(
   def createApplicationSubmissionContext(
       newApp: YarnClientApplication,
       containerContext: ContainerLaunchContext): ApplicationSubmissionContext = {
-    val amResources =
-      if (isClusterMode) {
-        sparkConf.getAllWithPrefix(config.YARN_DRIVER_RESOURCE_TYPES_PREFIX).toMap
-      } else {
-        sparkConf.getAllWithPrefix(config.YARN_AM_RESOURCE_TYPES_PREFIX).toMap
-      }
+
+    val componentName = if (isClusterMode) {
+      config.YARN_DRIVER_RESOURCE_TYPES_PREFIX
+    } else {
+      config.YARN_AM_RESOURCE_TYPES_PREFIX
+    }
+    val yarnAMResources = getYarnResourcesAndAmounts(sparkConf, componentName)
+    val amResources = yarnAMResources ++
+      getYarnResourcesFromSparkResources(SPARK_DRIVER_PREFIX, sparkConf)
     logDebug(s"AM resources: $amResources")
     val appContext = newApp.getApplicationSubmissionContext
     appContext.setApplicationName(sparkConf.get("spark.app.name", "Spark"))
     appContext.setQueue(sparkConf.get(QUEUE_NAME))
     appContext.setAMContainerSpec(containerContext)
-    appContext.setApplicationType("SPARK")
+    appContext.setApplicationType(sparkConf.get(APPLICATION_TYPE))
 
     sparkConf.get(APPLICATION_TAGS).foreach { tags =>
       appContext.setApplicationTags(new java.util.HashSet[String](tags.asJava))
@@ -299,6 +307,10 @@ private[spark] class Client(
       }
     }
     appContext.setUnmanagedAM(isClientUnmanagedAMEnabled)
+
+    sparkConf.get(APPLICATION_PRIORITY).foreach { appPriority =>
+      appContext.setPriority(Priority.newInstance(appPriority))
+    }
     appContext
   }
 
@@ -340,12 +352,14 @@ private[spark] class Client(
     val maxMem = newAppResponse.getMaximumResourceCapability().getMemory()
     logInfo("Verifying our application has not requested more than the maximum " +
       s"memory capability of the cluster ($maxMem MB per container)")
-    val executorMem = executorMemory + executorMemoryOverhead + pysparkWorkerMemory
+    val executorMem =
+      executorMemory + executorOffHeapMemory + executorMemoryOverhead + pysparkWorkerMemory
     if (executorMem > maxMem) {
-      throw new IllegalArgumentException(s"Required executor memory ($executorMemory), overhead " +
-        s"($executorMemoryOverhead MB), and PySpark memory ($pysparkWorkerMemory MB) is above " +
-        s"the max threshold ($maxMem MB) of this cluster! Please check the values of " +
-        s"'yarn.scheduler.maximum-allocation-mb' and/or 'yarn.nodemanager.resource.memory-mb'.")
+      throw new IllegalArgumentException(s"Required executor memory ($executorMemory MB), " +
+        s"offHeap memory ($executorOffHeapMemory) MB, overhead ($executorMemoryOverhead MB), " +
+        s"and PySpark memory ($pysparkWorkerMemory MB) is above the max threshold ($maxMem MB) " +
+        "of this cluster! Please check the values of 'yarn.scheduler.maximum-allocation-mb' " +
+        "and/or 'yarn.nodemanager.resource.memory-mb'.")
     }
     val amMem = amMemory + amMemoryOverhead
     if (amMem > maxMem) {
@@ -524,7 +538,11 @@ private[spark] class Client(
             if (!Utils.isLocalUri(jar)) {
               val path = getQualifiedLocalPath(Utils.resolveURI(jar), hadoopConf)
               val pathFs = FileSystem.get(path.toUri(), hadoopConf)
-              pathFs.globStatus(path).filter(_.isFile()).foreach { entry =>
+              val fss = pathFs.globStatus(path)
+              if (fss == null) {
+                throw new FileNotFoundException(s"Path ${path.toString} does not exist")
+              }
+              fss.filter(_.isFile()).foreach { entry =>
                 val uri = entry.getPath().toUri()
                 statCache.update(uri, entry)
                 distribute(uri.toString(), targetDir = Some(LOCALIZED_LIB_DIR))
@@ -617,7 +635,12 @@ private[spark] class Client(
       distribute(args.primaryPyFile, appMasterOnly = true)
     }
 
-    pySparkArchives.foreach { f => distribute(f) }
+    pySparkArchives.foreach { f =>
+      val uri = Utils.resolveURI(f)
+      if (uri.getScheme != Utils.LOCAL_SCHEME) {
+        distribute(f)
+      }
+    }
 
     // The python files list needs to be treated especially. All files that are not an
     // archive need to be placed in a subdirectory that will be added to PYTHONPATH.
@@ -761,15 +784,8 @@ private[spark] class Client(
       val props = confToProperties(sparkConf)
 
       // If propagating the keytab to the AM, override the keytab name with the name of the
-      // distributed file. Otherwise remove princpal/keytab from the conf, so they're not seen
-      // by the AM at all.
-      amKeytabFileName match {
-        case Some(kt) =>
-          props.setProperty(KEYTAB.key, kt)
-        case None =>
-          props.remove(PRINCIPAL.key)
-          props.remove(KEYTAB.key)
-      }
+      // distributed file.
+      amKeytabFileName.foreach { kt => props.setProperty(KEYTAB.key, kt) }
 
       writePropertiesToArchive(props, SPARK_CONF_FILE, confStream)
 
@@ -970,7 +986,8 @@ private[spark] class Client(
       } else {
         Utils.classForName("org.apache.spark.deploy.yarn.ExecutorLauncher").getName
       }
-    if (args.primaryRFile != null && args.primaryRFile.endsWith(".R")) {
+    if (args.primaryRFile != null &&
+        (args.primaryRFile.endsWith(".R") || args.primaryRFile.endsWith(".r"))) {
       args.userArgs = ArrayBuffer(args.primaryRFile) ++ args.userArgs
     }
     val userArgs = args.userArgs.flatMap { arg =>
@@ -1196,7 +1213,7 @@ private[spark] class Client(
         val pyArchivesFile = new File(pyLibPath, "pyspark.zip")
         require(pyArchivesFile.exists(),
           s"$pyArchivesFile not found; cannot run pyspark application in YARN mode.")
-        val py4jFile = new File(pyLibPath, "py4j-0.10.8.1-src.zip")
+        val py4jFile = new File(pyLibPath, PythonUtils.PY4J_ZIP_NAME)
         require(py4jFile.exists(),
           s"$py4jFile not found; cannot run pyspark application in YARN mode.")
         Seq(pyArchivesFile.getAbsolutePath(), py4jFile.getAbsolutePath())
@@ -1341,7 +1358,10 @@ private object Client extends Logging {
       }
     }
 
-    populateHadoopClasspath(conf, env)
+    if (sparkConf.get(POPULATE_HADOOP_CLASSPATH)) {
+      populateHadoopClasspath(conf, env)
+    }
+
     sys.env.get(ENV_DIST_CLASSPATH).foreach { cp =>
       addClasspathEntry(getClusterPath(sparkConf, cp), env)
     }

@@ -18,21 +18,34 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import scala.collection.immutable.TreeSet
+import scala.collection.mutable
 
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.CatalystTypeConverters.convertToScala
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode, FalseLiteral, GenerateSafeProjection, GenerateUnsafeProjection, Predicate => BasePredicate}
+import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReference
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LeafNode, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.util.TypeUtils
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 
-object InterpretedPredicate {
-  def create(expression: Expression, inputSchema: Seq[Attribute]): InterpretedPredicate =
-    create(BindReferences.bindReference(expression, inputSchema))
+/**
+ * A base class for generated/interpreted predicate
+ */
+abstract class BasePredicate {
+  def eval(r: InternalRow): Boolean
 
-  def create(expression: Expression): InterpretedPredicate = new InterpretedPredicate(expression)
+  /**
+   * Initializes internal states given the current partition index.
+   * This is used by nondeterministic expressions to set initial states.
+   * The default implementation does nothing.
+   */
+  def initialize(partitionIndex: Int): Unit = {}
 }
 
 case class InterpretedPredicate(expression: Expression) extends BasePredicate {
@@ -54,13 +67,78 @@ trait Predicate extends Expression {
   override def dataType: DataType = BooleanType
 }
 
+/**
+ * The factory object for `BasePredicate`.
+ */
+object Predicate extends CodeGeneratorWithInterpretedFallback[Expression, BasePredicate] {
 
-trait PredicateHelper {
+  override protected def createCodeGeneratedObject(in: Expression): BasePredicate = {
+    GeneratePredicate.generate(in)
+  }
+
+  override protected def createInterpretedObject(in: Expression): BasePredicate = {
+    InterpretedPredicate(in)
+  }
+
+  def createInterpreted(e: Expression): InterpretedPredicate = InterpretedPredicate(e)
+
+  /**
+   * Returns a BasePredicate for an Expression, which will be bound to `inputSchema`.
+   */
+  def create(e: Expression, inputSchema: Seq[Attribute]): BasePredicate = {
+    createObject(bindReference(e, inputSchema))
+  }
+
+  /**
+   * Returns a BasePredicate for a given bound Expression.
+   */
+  def create(e: Expression): BasePredicate = {
+    createObject(e)
+  }
+}
+
+trait PredicateHelper extends Logging {
   protected def splitConjunctivePredicates(condition: Expression): Seq[Expression] = {
     condition match {
       case And(cond1, cond2) =>
         splitConjunctivePredicates(cond1) ++ splitConjunctivePredicates(cond2)
       case other => other :: Nil
+    }
+  }
+
+  /**
+   * Find the origin of where the input references of expression exp were scanned in the tree of
+   * plan, and if they originate from a single leaf node.
+   * Returns optional tuple with Expression, undoing any projections and aliasing that has been done
+   * along the way from plan to origin, and the origin LeafNode plan from which all the exp
+   */
+  def findExpressionAndTrackLineageDown(
+      exp: Expression,
+      plan: LogicalPlan): Option[(Expression, LogicalPlan)] = {
+
+    plan match {
+      case Project(projectList, child) =>
+        val aliases = AttributeMap(projectList.collect {
+          case a @ Alias(child, _) => (a.toAttribute, child)
+        })
+        findExpressionAndTrackLineageDown(replaceAlias(exp, aliases), child)
+      // we can unwrap only if there are row projections, and no aggregation operation
+      case Aggregate(_, aggregateExpressions, child) =>
+        val aliasMap = AttributeMap(aggregateExpressions.collect {
+          case a: Alias if a.child.find(_.isInstanceOf[AggregateExpression]).isEmpty =>
+            (a.toAttribute, a.child)
+        })
+        findExpressionAndTrackLineageDown(replaceAlias(exp, aliasMap), child)
+      case l: LeafNode if exp.references.subsetOf(l.outputSet) =>
+        Some((exp, l))
+      case other =>
+        other.children.flatMap {
+          child => if (exp.references.subsetOf(child.outputSet)) {
+            findExpressionAndTrackLineageDown(exp, child)
+          } else {
+            None
+          }
+        }.headOption
     }
   }
 
@@ -115,8 +193,104 @@ trait PredicateHelper {
       // non-correlated subquery will be replaced as literal
       e.children.isEmpty
     case a: AttributeReference => true
+    // PythonUDF will be executed by dedicated physical operator later.
+    // For PythonUDFs that can't be evaluated in join condition, `ExtractPythonUDFFromJoinCondition`
+    // will pull them out later.
+    case _: PythonUDF => true
     case e: Unevaluable => false
     case e => e.children.forall(canEvaluateWithinJoin)
+  }
+
+  /**
+   * Convert an expression into conjunctive normal form.
+   * Definition and algorithm: https://en.wikipedia.org/wiki/Conjunctive_normal_form
+   * CNF can explode exponentially in the size of the input expression when converting [[Or]]
+   * clauses. Use a configuration [[SQLConf.MAX_CNF_NODE_COUNT]] to prevent such cases.
+   *
+   * @param condition to be converted into CNF.
+   * @return the CNF result as sequence of disjunctive expressions. If the number of expressions
+   *         exceeds threshold on converting `Or`, `Seq.empty` is returned.
+   */
+  protected def conjunctiveNormalForm(condition: Expression): Seq[Expression] = {
+    val postOrderNodes = postOrderTraversal(condition)
+    val resultStack = new mutable.Stack[Seq[Expression]]
+    val maxCnfNodeCount = SQLConf.get.maxCnfNodeCount
+    // Bottom up approach to get CNF of sub-expressions
+    while (postOrderNodes.nonEmpty) {
+      val cnf = postOrderNodes.pop() match {
+        case _: And =>
+          val right = resultStack.pop()
+          val left = resultStack.pop()
+          left ++ right
+        case _: Or =>
+          // For each side, there is no need to expand predicates of the same references.
+          // So here we can aggregate predicates of the same qualifier as one single predicate,
+          // for reducing the size of pushed down predicates and corresponding codegen.
+          val right = groupExpressionsByQualifier(resultStack.pop())
+          val left = groupExpressionsByQualifier(resultStack.pop())
+          // Stop the loop whenever the result exceeds the `maxCnfNodeCount`
+          if (left.size * right.size > maxCnfNodeCount) {
+            logInfo(s"As the result size exceeds the threshold $maxCnfNodeCount. " +
+              "The CNF conversion is skipped and returning Seq.empty now. To avoid this, you can " +
+              s"raise the limit ${SQLConf.MAX_CNF_NODE_COUNT.key}.")
+            return Seq.empty
+          } else {
+            for { x <- left; y <- right } yield Or(x, y)
+          }
+        case other => other :: Nil
+      }
+      resultStack.push(cnf)
+    }
+    if (resultStack.length != 1) {
+      logWarning("The length of CNF conversion result stack is supposed to be 1. There might " +
+        "be something wrong with CNF conversion.")
+      return Seq.empty
+    }
+    resultStack.top
+  }
+
+  private def groupExpressionsByQualifier(expressions: Seq[Expression]): Seq[Expression] = {
+    expressions.groupBy(_.references.map(_.qualifier)).map(_._2.reduceLeft(And)).toSeq
+  }
+
+  /**
+   * Iterative post order traversal over a binary tree built by And/Or clauses with two stacks.
+   * For example, a condition `(a And b) Or c`, the postorder traversal is
+   * (`a`,`b`, `And`, `c`, `Or`).
+   * Following is the complete algorithm. After step 2, we get the postorder traversal in
+   * the second stack.
+   * 1. Push root to first stack.
+   * 2. Loop while first stack is not empty
+   *    2.1 Pop a node from first stack and push it to second stack
+   *    2.2 Push the children of the popped node to first stack
+   *
+   * @param condition to be traversed as binary tree
+   * @return sub-expressions in post order traversal as a stack.
+   *         The first element of result stack is the leftmost node.
+   */
+  private def postOrderTraversal(condition: Expression): mutable.Stack[Expression] = {
+    val stack = new mutable.Stack[Expression]
+    val result = new mutable.Stack[Expression]
+    stack.push(condition)
+    while (stack.nonEmpty) {
+      val node = stack.pop()
+      node match {
+        case Not(a And b) => stack.push(Or(Not(a), Not(b)))
+        case Not(a Or b) => stack.push(And(Not(a), Not(b)))
+        case Not(Not(a)) => stack.push(a)
+        case a And b =>
+          result.push(node)
+          stack.push(a)
+          stack.push(b)
+        case a Or b =>
+          result.push(node)
+          stack.push(a)
+          stack.push(b)
+        case _ =>
+          result.push(node)
+      }
+    }
+    result
   }
 }
 
@@ -375,6 +549,19 @@ case class InSet(child: Expression, hset: Set[Any]) extends UnaryExpression with
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    if (canBeComputedUsingSwitch && hset.size <= SQLConf.get.optimizerInSetSwitchThreshold) {
+      genCodeWithSwitch(ctx, ev)
+    } else {
+      genCodeWithSet(ctx, ev)
+    }
+  }
+
+  private def canBeComputedUsingSwitch: Boolean = child.dataType match {
+    case ByteType | ShortType | IntegerType | DateType => true
+    case _ => false
+  }
+
+  private def genCodeWithSet(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     nullSafeCodeGen(ctx, ev, c => {
       val setTerm = ctx.addReferenceObj("set", set)
       val setIsNull = if (hasNull) {
@@ -389,9 +576,47 @@ case class InSet(child: Expression, hset: Set[Any]) extends UnaryExpression with
     })
   }
 
+  // spark.sql.optimizer.inSetSwitchThreshold has an appropriate upper limit,
+  // so the code size should not exceed 64KB
+  private def genCodeWithSwitch(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    val caseValuesGen = hset.filter(_ != null).map(Literal(_).genCode(ctx))
+    val valueGen = child.genCode(ctx)
+
+    val caseBranches = caseValuesGen.map(literal =>
+      code"""
+        case ${literal.value}:
+          ${ev.value} = true;
+          break;
+       """)
+
+    val switchCode = if (caseBranches.size > 0) {
+      code"""
+        switch (${valueGen.value}) {
+          ${caseBranches.mkString("\n")}
+          default:
+            ${ev.isNull} = $hasNull;
+        }
+       """
+    } else {
+      s"${ev.isNull} = $hasNull;"
+    }
+
+    ev.copy(code =
+      code"""
+        ${valueGen.code}
+        ${CodeGenerator.JAVA_BOOLEAN} ${ev.isNull} = ${valueGen.isNull};
+        ${CodeGenerator.JAVA_BOOLEAN} ${ev.value} = false;
+        if (!${valueGen.isNull}) {
+          $switchCode
+        }
+       """)
+  }
+
   override def sql: String = {
     val valueSQL = child.sql
-    val listSQL = hset.toSeq.map(Literal(_).sql).mkString(", ")
+    val listSQL = hset.toSeq
+      .map(elem => Literal(elem, child.dataType).sql)
+      .mkString(", ")
     s"($valueSQL IN ($listSQL))"
   }
 }
@@ -797,4 +1022,26 @@ case class GreaterThanOrEqual(left: Expression, right: Expression)
   override def symbol: String = ">="
 
   protected override def nullSafeEval(input1: Any, input2: Any): Any = ordering.gteq(input1, input2)
+}
+
+/**
+ * IS UNKNOWN and IS NOT UNKNOWN are the same as IS NULL and IS NOT NULL, respectively,
+ * except that the input expression must be of a boolean type.
+ */
+object IsUnknown {
+  def apply(child: Expression): Predicate = {
+    new IsNull(child) with ExpectsInputTypes {
+      override def inputTypes: Seq[DataType] = Seq(BooleanType)
+      override def sql: String = s"(${child.sql} IS UNKNOWN)"
+    }
+  }
+}
+
+object IsNotUnknown {
+  def apply(child: Expression): Predicate = {
+    new IsNotNull(child) with ExpectsInputTypes {
+      override def inputTypes: Seq[DataType] = Seq(BooleanType)
+      override def sql: String = s"(${child.sql} IS NOT UNKNOWN)"
+    }
+  }
 }
